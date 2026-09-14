@@ -1,6 +1,6 @@
 # 로컬 접속 정보 및 VM 목록
 #config.env
-#vm_list.txt
+vm_list.txt
 
 # fio 실행 결과와 미완성 수집 파일
 results/

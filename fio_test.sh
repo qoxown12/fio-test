@@ -73,10 +73,10 @@ source "$CONFIG_FILE"
 if ! declare -p FIO_TEST_CASES >/dev/null 2>&1; then
     FIO_TEST_CASES=(
         "randread:4k"
-        "randwrite:4k"
         "randread:8k"
-        "randwrite:8k"
         "read:128k"
+        "randwrite:4k"
+        "randwrite:8k"
         "write:128k"
     )
 fi

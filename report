@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Tuple
 
@@ -22,6 +23,12 @@ FIO_RESULT_PATTERN = re.compile(
     re.MULTILINE,
 )
 FIO_ERROR_PATTERN = re.compile(r"\berr=\s*(?P<error>[0-9]+)\b")
+IOPS_VALUE_PATTERN = re.compile(
+    r"^(?P<number>[0-9]+(?:\.[0-9]+)?)(?P<unit>[kKmMgGtTpPeE]?)$"
+)
+BANDWIDTH_VALUE_PATTERN = re.compile(
+    r"^(?P<number>[0-9]+(?:\.[0-9]+)?)(?P<unit>[kKmMgGtTpPeE]?i?[bB])/s$"
+)
 DEFAULT_REPORT_FILENAME = "fio_summary.csv"
 
 
@@ -51,6 +58,8 @@ class Workload(NamedTuple):
 class Measurement(NamedTuple):
     iops: str
     bandwidth: str
+    iops_value: Decimal
+    bandwidth_bytes_per_second: Decimal
 
 
 def block_size_to_bytes(value: str) -> int:
@@ -71,6 +80,117 @@ def block_size_to_bytes(value: str) -> int:
         "p": 1024**5,
     }.get(unit)
     return number * multiplier if multiplier is not None else sys.maxsize
+
+
+def parse_iops_value(value: str) -> Decimal:
+    match = IOPS_VALUE_PATTERN.fullmatch(value)
+    if not match:
+        raise ValueError(f"지원하지 않는 IOPS 형식입니다: {value}")
+
+    try:
+        number = Decimal(match.group("number"))
+    except InvalidOperation as error:
+        raise ValueError(f"IOPS 숫자 형식이 잘못되었습니다: {value}") from error
+
+    exponent = {
+        "": 0,
+        "k": 1,
+        "m": 2,
+        "g": 3,
+        "t": 4,
+        "p": 5,
+        "e": 6,
+    }[match.group("unit").lower()]
+    return number * (Decimal(1000) ** exponent)
+
+
+def parse_bandwidth_value(value: str) -> Decimal:
+    match = BANDWIDTH_VALUE_PATTERN.fullmatch(value)
+    if not match:
+        raise ValueError(f"지원하지 않는 대역폭 형식입니다: {value}")
+
+    try:
+        number = Decimal(match.group("number"))
+    except InvalidOperation as error:
+        raise ValueError(f"대역폭 숫자 형식이 잘못되었습니다: {value}") from error
+
+    unit = match.group("unit").lower()
+    factors = {
+        "b": 1,
+        "kb": 1000,
+        "mb": 1000**2,
+        "gb": 1000**3,
+        "tb": 1000**4,
+        "pb": 1000**5,
+        "eb": 1000**6,
+        "kib": 1024,
+        "mib": 1024**2,
+        "gib": 1024**3,
+        "tib": 1024**4,
+        "pib": 1024**5,
+        "eib": 1024**6,
+    }
+    factor = factors.get(unit)
+    if factor is None:
+        raise ValueError(f"지원하지 않는 대역폭 단위입니다: {value}")
+    return number * factor
+
+
+def format_scaled_value(
+    value: Decimal,
+    units: List[Tuple[str, int]],
+    trailing_text: str = "",
+) -> str:
+    selected_symbol = ""
+    selected_factor = 1
+    for symbol, factor in reversed(units):
+        if value >= factor or factor == 1:
+            selected_symbol = symbol
+            selected_factor = factor
+            break
+
+    scaled = value / Decimal(selected_factor)
+    if scaled >= 100:
+        precision = 0
+    elif scaled >= 10:
+        precision = 1
+    else:
+        precision = 2
+    formatted = format(scaled, f".{precision}f")
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return f"{formatted}{selected_symbol}{trailing_text}"
+
+
+def format_iops(value: Decimal) -> str:
+    return format_scaled_value(
+        value,
+        [
+            ("", 1),
+            ("k", 1000),
+            ("M", 1000**2),
+            ("G", 1000**3),
+            ("T", 1000**4),
+            ("P", 1000**5),
+            ("E", 1000**6),
+        ],
+    )
+
+
+def format_bandwidth(value: Decimal) -> str:
+    return format_scaled_value(
+        value,
+        [
+            ("B", 1),
+            ("KiB", 1024),
+            ("MiB", 1024**2),
+            ("GiB", 1024**3),
+            ("TiB", 1024**4),
+            ("PiB", 1024**5),
+            ("EiB", 1024**6),
+        ],
+        "/s",
+    )
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -165,9 +285,13 @@ def parse_log(path: Path, expected_direction: str) -> Measurement:
         raise ValueError("IOPS/BW 결과 행을 찾을 수 없습니다")
 
     result = matches[-1]
+    iops = result.group("iops")
+    bandwidth = result.group("bandwidth")
     return Measurement(
-        iops=result.group("iops"),
-        bandwidth=result.group("bandwidth"),
+        iops=iops,
+        bandwidth=bandwidth,
+        iops_value=parse_iops_value(iops),
+        bandwidth_bytes_per_second=parse_bandwidth_value(bandwidth),
     )
 
 
@@ -245,6 +369,47 @@ def write_csv(
                     ),
                 ]
             )
+
+        average_iops: List[str] = []
+        average_bandwidth: List[str] = []
+        total_iops: List[str] = []
+        total_bandwidth: List[str] = []
+        for workload in workloads:
+            measurements = [
+                vm_results[workload]
+                for vm_results in results.values()
+                if workload in vm_results
+            ]
+            if not measurements:
+                average_iops.append("")
+                average_bandwidth.append("")
+                total_iops.append("")
+                total_bandwidth.append("")
+                continue
+
+            iops_sum = sum(
+                (measurement.iops_value for measurement in measurements),
+                Decimal(0),
+            )
+            bandwidth_sum = sum(
+                (
+                    measurement.bandwidth_bytes_per_second
+                    for measurement in measurements
+                ),
+                Decimal(0),
+            )
+            measurement_count = Decimal(len(measurements))
+            average_iops.append(format_iops(iops_sum / measurement_count))
+            average_bandwidth.append(
+                format_bandwidth(bandwidth_sum / measurement_count)
+            )
+            total_iops.append(format_iops(iops_sum))
+            total_bandwidth.append(format_bandwidth(bandwidth_sum))
+
+        writer.writerow(["평균", "IOPS", *average_iops])
+        writer.writerow(["평균", "대역폭", *average_bandwidth])
+        writer.writerow(["합계", "IOPS", *total_iops])
+        writer.writerow(["합계", "대역폭", *total_bandwidth])
 
     return len(results), len(workloads)
 
