@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""fio_test.sh 결과 로그를 VM별 CSV 요약표로 변환한다."""
+
+import argparse
+import csv
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+from typing import Dict, List, NamedTuple, Tuple
+
+
+LOG_NAME_PATTERN = re.compile(
+    r"^(?P<vm>.+)_(?P<kind>random|sequential)_"
+    r"(?P<direction>read|write)_(?P<bs>[0-9]+[A-Za-z]*)_"
+    r"(?P<timestamp>[0-9]{8}_[0-9]{6})\.log$"
+)
+FIO_RESULT_PATTERN = re.compile(
+    r"^\s*(?P<direction>read|write):\s+"
+    r"IOPS=(?P<iops>[^,\s]+),\s+BW=(?P<bandwidth>[^\s(,]+)",
+    re.MULTILINE,
+)
+FIO_ERROR_PATTERN = re.compile(r"\berr=\s*(?P<error>[0-9]+)\b")
+DEFAULT_REPORT_FILENAME = "fio_summary.csv"
+
+
+class Workload(NamedTuple):
+    kind: str
+    direction: str
+    block_size: str
+
+    @property
+    def label(self) -> str:
+        kind_ko = "랜덤" if self.kind == "random" else "순차"
+        direction_ko = "읽기" if self.direction == "read" else "쓰기"
+        return f"{kind_ko} {direction_ko} 성능 ({self.block_size.upper()})"
+
+    @property
+    def sort_key(self) -> Tuple[int, int, int, str]:
+        kind_order = 0 if self.kind == "random" else 1
+        direction_order = 0 if self.direction == "read" else 1
+        return (
+            kind_order,
+            block_size_to_bytes(self.block_size),
+            direction_order,
+            self.block_size,
+        )
+
+
+class Measurement(NamedTuple):
+    iops: str
+    bandwidth: str
+
+
+def block_size_to_bytes(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+)([A-Za-z]*)", value)
+    if not match:
+        return sys.maxsize
+
+    number = int(match.group(1))
+    unit = match.group(2).lower()
+    if unit.endswith("b"):
+        unit = unit[:-1]
+    multiplier = {
+        "": 1,
+        "k": 1024,
+        "m": 1024**2,
+        "g": 1024**3,
+        "t": 1024**4,
+        "p": 1024**5,
+    }.get(unit)
+    return number * multiplier if multiplier is not None else sys.maxsize
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "fio 결과 로그를 VM별 IOPS/대역폭 CSV로 요약합니다. "
+            "폴더를 생략하면 results 아래의 모든 실행 폴더를 처리합니다."
+        )
+    )
+    parser.add_argument(
+        "result_dir",
+        nargs="?",
+        type=Path,
+        help="처리할 fio 실행 결과 폴더 (생략 시 모든 results 하위 폴더)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="출력 CSV 경로 (기본값: config.env의 REPORT_FILENAME)",
+    )
+    return parser.parse_args()
+
+
+def load_report_filename() -> str:
+    configured_path = os.environ.get("FIO_CONFIG_FILE")
+    config_path = (
+        Path(configured_path).expanduser()
+        if configured_path
+        else Path(__file__).resolve().parent / "config.env"
+    )
+
+    if not config_path.is_file():
+        print(
+            f"경고: 설정 파일을 찾을 수 없어 기본 보고서 파일명을 사용합니다: "
+            f"{DEFAULT_REPORT_FILENAME}",
+            file=sys.stderr,
+        )
+        return DEFAULT_REPORT_FILENAME
+
+    report_filename = DEFAULT_REPORT_FILENAME
+    try:
+        config_lines = config_path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        print(
+            f"경고: 설정 파일을 읽을 수 없어 기본 보고서 파일명을 사용합니다: "
+            f"{error}",
+            file=sys.stderr,
+        )
+        return DEFAULT_REPORT_FILENAME
+
+    for line in config_lines:
+        match = re.match(r"^\s*REPORT_FILENAME\s*=\s*(.*)$", line)
+        if not match:
+            continue
+        try:
+            values = shlex.split(match.group(1), comments=True, posix=True)
+        except ValueError as error:
+            raise ValueError(f"config.env의 REPORT_FILENAME 형식 오류: {error}")
+        if len(values) != 1:
+            raise ValueError("config.env의 REPORT_FILENAME은 파일명 하나여야 합니다")
+        report_filename = values[0]
+
+    if (
+        not report_filename
+        or report_filename in (".", "..")
+        or "/" in report_filename
+        or "\\" in report_filename
+    ):
+        raise ValueError(
+            "config.env의 REPORT_FILENAME에는 경로가 아닌 파일명만 입력해야 합니다"
+        )
+    return report_filename
+
+
+def parse_log(path: Path, expected_direction: str) -> Measurement:
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise ValueError(f"파일을 읽을 수 없습니다: {error}") from error
+
+    fio_error = FIO_ERROR_PATTERN.search(content)
+    if fio_error and fio_error.group("error") != "0":
+        raise ValueError(f"fio가 오류 코드 {fio_error.group('error')}로 종료되었습니다")
+
+    matches = [
+        match
+        for match in FIO_RESULT_PATTERN.finditer(content)
+        if match.group("direction") == expected_direction
+    ]
+    if not matches:
+        raise ValueError("IOPS/BW 결과 행을 찾을 수 없습니다")
+
+    result = matches[-1]
+    return Measurement(
+        iops=result.group("iops"),
+        bandwidth=result.group("bandwidth"),
+    )
+
+
+def collect_results(
+    result_dir: Path,
+) -> Tuple[Dict[str, Dict[Workload, Measurement]], List[str]]:
+    results: Dict[str, Dict[Workload, Measurement]] = {}
+    warnings: List[str] = []
+
+    for log_path in sorted(result_dir.glob("*.log")):
+        match = LOG_NAME_PATTERN.match(log_path.name)
+        if not match:
+            # errors.log 등 fio 결과가 아닌 로그는 무시한다.
+            continue
+
+        workload = Workload(
+            kind=match.group("kind"),
+            direction=match.group("direction"),
+            block_size=match.group("bs"),
+        )
+        vm = match.group("vm")
+
+        try:
+            measurement = parse_log(log_path, workload.direction)
+        except ValueError as error:
+            warnings.append(f"{log_path.name}: {error}")
+            continue
+
+        vm_results = results.setdefault(vm, {})
+        if workload in vm_results:
+            warnings.append(
+                f"{log_path.name}: 동일 VM/테스트 결과가 중복되어 마지막 파일을 사용합니다"
+            )
+        vm_results[workload] = measurement
+
+    return results, warnings
+
+
+def write_csv(
+    output_path: Path,
+    results: Dict[str, Dict[Workload, Measurement]],
+) -> Tuple[int, int]:
+    workloads = sorted(
+        {workload for vm_results in results.values() for workload in vm_results},
+        key=lambda workload: workload.sort_key,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # utf-8-sig는 Excel에서 한글 헤더가 깨지지 않도록 BOM을 기록한다.
+    with output_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["가상머신", "항목", *(workload.label for workload in workloads)])
+
+        for vm in sorted(results):
+            vm_results = results[vm]
+            writer.writerow(
+                [
+                    vm,
+                    "IOPS",
+                    *(
+                        vm_results[workload].iops if workload in vm_results else ""
+                        for workload in workloads
+                    ),
+                ]
+            )
+            writer.writerow(
+                [
+                    vm,
+                    "대역폭",
+                    *(
+                        vm_results[workload].bandwidth
+                        if workload in vm_results
+                        else ""
+                        for workload in workloads
+                    ),
+                ]
+            )
+
+    return len(results), len(workloads)
+
+
+def create_report(
+    result_dir: Path,
+    report_filename: str,
+    output_path: Path = None,
+) -> bool:
+    if not result_dir.is_dir():
+        print(f"오류: 결과 폴더를 찾을 수 없습니다: {result_dir}", file=sys.stderr)
+        return False
+
+    results, warnings = collect_results(result_dir)
+    for warning in warnings:
+        print(f"경고 [{result_dir.name}]: {warning}", file=sys.stderr)
+
+    if not results:
+        print(
+            f"건너뜀: 분석 가능한 fio 결과 로그가 없습니다: {result_dir}",
+            file=sys.stderr,
+        )
+        return False
+
+    output_path = output_path.expanduser() if output_path else result_dir / report_filename
+    if not output_path.is_absolute():
+        output_path = (Path.cwd() / output_path).resolve()
+
+    vm_count, workload_count = write_csv(output_path, results)
+    print(f"CSV 생성 완료: {output_path}")
+    print(f"가상머신: {vm_count}대, 테스트 항목: {workload_count}개")
+    if warnings:
+        print(f"경고: {len(warnings)}건 (위 메시지 확인)", file=sys.stderr)
+    return True
+
+
+def main() -> int:
+    args = parse_arguments()
+    try:
+        report_filename = load_report_filename()
+    except ValueError as error:
+        print(f"오류: {error}", file=sys.stderr)
+        return 1
+
+    if args.result_dir is not None:
+        result_dir = args.result_dir.expanduser().resolve()
+        return 0 if create_report(result_dir, report_filename, args.output) else 1
+
+    if args.output is not None:
+        print(
+            "오류: 전체 폴더 처리 모드에서는 -o/--output을 사용할 수 없습니다. "
+            "CSV는 각 결과 폴더에 생성됩니다.",
+            file=sys.stderr,
+        )
+        return 1
+
+    results_root = Path(__file__).resolve().parent / "results"
+    if not results_root.is_dir():
+        print(f"오류: results 폴더를 찾을 수 없습니다: {results_root}", file=sys.stderr)
+        return 1
+
+    result_dirs = sorted(path for path in results_root.iterdir() if path.is_dir())
+    if not result_dirs:
+        print(f"오류: 처리할 결과 폴더가 없습니다: {results_root}", file=sys.stderr)
+        return 1
+
+    created_count = 0
+    skipped_count = 0
+    print(f"전체 결과 폴더 처리 시작: {results_root} ({len(result_dirs)}개)")
+    for result_dir in result_dirs:
+        if create_report(result_dir, report_filename):
+            created_count += 1
+        else:
+            skipped_count += 1
+
+    print(
+        f"전체 처리 완료: CSV 생성 {created_count}개, "
+        f"건너뜀 {skipped_count}개"
+    )
+    return 0 if created_count > 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

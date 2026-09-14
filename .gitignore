@@ -1,0 +1,17 @@
+# 로컬 접속 정보 및 VM 목록
+#config.env
+#vm_list.txt
+
+# fio 실행 결과와 미완성 수집 파일
+results/
+*.part.*
+
+# fio 테스트 데이터 파일이 저장소 안에 생성된 경우
+fio_test.*.0
+
+# Python 및 편집기 임시 파일
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+.DS_Store
